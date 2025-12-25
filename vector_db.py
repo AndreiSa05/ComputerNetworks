@@ -8,7 +8,7 @@ class QdrantStorage:
         if not self.client.collection_exists(self.collection):
             self.client.create_collection(
                 collection_name=self.collection,
-                vector_config=VectorParams(size=dim, distance=Distance.COSINE),
+                vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
             )
 
     def upsert(self, ids, vectors, payloads):
