@@ -1,6 +1,7 @@
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 
+
 class QdrantStorage:
     def __init__(self, url="http://localhost:6333", collection="docs", dim=3072):
         self.client = QdrantClient(url=url, timeout=30)
@@ -13,24 +14,30 @@ class QdrantStorage:
 
     def upsert(self, ids, vectors, payloads):
         points = [PointStruct(id=ids[i], vector=vectors[i], payload=payloads[i]) for i in range(len(ids))]
-        self.client.upsert(self.collection, points)
+        self.client.upsert(
+            collection_name=self.collection,
+            points=points,
+            wait=True,
+        )
 
     def search(self, query_vector, top_k: int = 5):
-        results=self.client.search(
+        res = self.client.query_points(
             collection_name=self.collection,
-            query_vector=query_vector,
+            query=query_vector,
             with_payload=True,
             limit=top_k,
         )
-        context=[]
-        sources=set()
 
-        for result in results:
-            payload=getattr(result, "payload", None) or {}
-            text=payload.get("text", "")
-            source=payload.get("source", "")
+        contexts = []
+        sources = set()
+
+        for point in res.points:
+            payload = point.payload or {}
+            text = payload.get("text", "")
+            source = payload.get("source", "")
             if text:
-                context.append(text)
-                sources.add(source)
+                contexts.append(text)
+                if source:
+                    sources.add(source)
 
-        return {"context": context, "sources": list(sources)}
+        return {"contexts": contexts, "sources": list(sources)}
