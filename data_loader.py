@@ -6,10 +6,29 @@ from dotenv import load_dotenv
 load_dotenv()
 
 client = OpenAI()
+
 EMBED_MODEL = "text-embedding-3-large"
 EMBED_DIM = 3072
 
 splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=200)
+# splitter = SentenceSplitter(chunk_size=700, chunk_overlap=150)
+
+ROLE_PATTERNS = [
+    "Data Protection Officer",
+    "DPO",
+    "CISO",
+    "Security Officer",
+    "IT Administrator",
+    "System Owner",
+    "Employee",
+    "Manager",
+    "HR",
+    "Legal",
+]
+
+
+def extract_roles(text: str) -> list[str]:
+    return [r for r in ROLE_PATTERNS if r in text]
 
 
 def load_and_chunk_pdf(path: str):
