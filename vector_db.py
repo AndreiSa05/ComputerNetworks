@@ -1,5 +1,5 @@
 from qdrant_client import QdrantClient
-from qdrant_client.models import VectorParams, Distance, PointStruct
+from qdrant_client.models import VectorParams, Distance, PointStruct, Filter, FieldCondition, MatchValue, MatchAny
 
 
 class QdrantStorage:
@@ -27,12 +27,31 @@ class QdrantStorage:
             wait=True,
         )
 
-    def search(self, query_vector, top_k: int = 5, min_score: float = 0.25):
+    def search(self, query_vector, top_k: int = 5, min_score: float = 0.25, allowed_sources: list[str] | None = None,):
+        if allowed_sources is not None and len(allowed_sources) == 0:
+            return {
+                "contexts": [],
+                "sources": [],
+                "roles": [],
+            }
+
+        query_filter = None
+        if allowed_sources:
+            query_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="source",
+                        match=MatchAny(any=allowed_sources)
+                    )
+                ]
+            )
+
         res = self.client.query_points(
             collection_name=self.collection,
             query=query_vector,
             with_payload=True,
             limit=top_k,
+            query_filter=query_filter,
         )
 
         contexts = []
@@ -78,3 +97,68 @@ class QdrantStorage:
             "sources": list(unique_sources),
             "roles": sorted(list(roles)),
         }
+
+    def list_documents(self, limit: int = 10_000) -> list[dict]:
+        documents = {}
+        offset = None
+
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.collection,
+                with_payload=True,
+                limit=1000,
+                offset=offset,
+            )
+
+            for p in points:
+                payload = p.payload or {}
+                source = payload.get("source")
+                if not source:
+                    continue
+
+                if source not in documents:
+                    documents[source] = {
+                        "source_id": source,
+                        "policy_type": payload.get("policy_type", ""),
+                        "version": payload.get("version", ""),
+                        "jurisdiction": payload.get("jurisdiction", ""),
+                        "chunks": 0,
+                    }
+
+                documents[source]["chunks"] += 1
+
+            if offset is None:
+                break
+
+        return list(documents.values())
+
+    def delete_document(self, source_id: str) -> int:
+
+        points, _ = self.client.scroll(
+            collection_name=self.collection,
+            with_payload=False,
+            limit=1,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="source",
+                        match=MatchValue(value=source_id)
+                    )
+                ]
+            ),
+        )
+
+        self.client.delete(
+            collection_name=self.collection,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(
+                        key="source",
+                        match=MatchValue(value=source_id)
+                    )
+                ]
+            ),
+            wait=True,
+        )
+
+        return len(points)

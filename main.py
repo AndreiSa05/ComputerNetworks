@@ -6,7 +6,7 @@ from inngest.experimental import ai
 from dotenv import load_dotenv
 import uuid
 import os
-import datetime
+from datetime import datetime
 from custom_types import RAGQueryResult, RAGSearchResult, RAGChunkAndSrc, RAGUpsertResult
 from data_loader import load_and_chunk_pdf, embed_texts, extract_roles
 from vector_db import QdrantStorage
@@ -30,7 +30,9 @@ inngest_client = inngest.Inngest(
 async def rag_ingest_pdf(ctx: inngest.Context):
     def _load(ctx: inngest.Context) -> RAGChunkAndSrc:
         pdf_path = ctx.event.data["pdf_path"]
-        source_id = ctx.event.data.get("source_id", pdf_path)
+        filename = os.path.basename(pdf_path)
+        timestamp = datetime.utcnow().isoformat(timespec="seconds")
+        source_id = f"{filename}::{timestamp}"
         chunks = load_and_chunk_pdf(pdf_path)
         return RAGChunkAndSrc(chunks=chunks, source_id=source_id)
 
@@ -62,10 +64,10 @@ async def rag_ingest_pdf(ctx: inngest.Context):
     trigger=inngest.TriggerEvent(event="rag/query_pdf_ai")
 )
 async def rag_query_pdf_ai(ctx: inngest.Context):
-    def _search(question: str, top_k: int = 5) -> RAGSearchResult:
+    def _search(question: str, top_k: int = 5, allowed_sources: list[str] | None = None, ) -> RAGSearchResult:
         query_vec = embed_texts([question])[0]
         store = QdrantStorage()
-        found = store.search(query_vec, top_k)
+        found = store.search(query_vec, top_k, allowed_sources=allowed_sources)
         return RAGSearchResult(contexts=found["contexts"], sources=found["sources"], roles=found["roles"])
 
     def select_context_chunks(chunks):
@@ -81,7 +83,8 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
     question = ctx.event.data["question"]
     top_k = int(ctx.event.data.get("top_k", 5))
 
-    found = await ctx.step.run("embed-and-search", lambda: _search(question, top_k), output_type=RAGSearchResult)
+    allowed_sources = ctx.event.data.get("allowed_sources")
+    found = await ctx.step.run("embed-and-search", lambda: _search(question, top_k, allowed_sources), output_type=RAGSearchResult)
 
     if not found.contexts:
         return {
@@ -97,7 +100,7 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
     selected_contexts = select_context_chunks(found.contexts)
     context_block = "\n\n".join(f"- {c}" for c in selected_contexts)
 
-    print(context_block)
+    #print(context_block)
 
     user_content = (
         "Use the following context to answer the question.\n\n"
@@ -141,6 +144,31 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
     }
 
 
+@inngest_client.create_function(
+    fn_id="RAG: List Documents",
+    trigger=inngest.TriggerEvent(event="rag/list_documents")
+)
+async def rag_list_documents(ctx: inngest.Context):
+    docs = QdrantStorage().list_documents()
+    return {"documents": docs}
+
+
+@inngest_client.create_function(
+    fn_id="RAG: Delete Document",
+    trigger=inngest.TriggerEvent(event="rag/delete_document")
+)
+async def rag_delete_document(ctx: inngest.Context):
+    source_id = ctx.event.data["source_id"]
+
+    store = QdrantStorage()
+    deleted = store.delete_document(source_id)
+
+    return {
+        "source_id": source_id,
+        "deleted": deleted,
+    }
+
+
 app = FastAPI()
 
-inngest.fast_api.serve(app, inngest_client, [rag_ingest_pdf, rag_query_pdf_ai])
+inngest.fast_api.serve(app, inngest_client, [rag_ingest_pdf, rag_query_pdf_ai, rag_list_documents, rag_delete_document])

@@ -3,22 +3,26 @@ from pathlib import Path
 import time
 import os
 import requests
-
+import tempfile
 import streamlit as st
 import inngest
 from dotenv import load_dotenv
+
+# -------------------------------------------------
+# Setup
+# -------------------------------------------------
 
 load_dotenv()
 
 st.set_page_config(
     page_title="Security Policy RAG",
     page_icon="🔐",
-    layout="centered",
+    layout="wide",
 )
 
-# -------------------------------
+# -------------------------------------------------
 # Inngest helpers
-# -------------------------------
+# -------------------------------------------------
 
 @st.cache_resource
 def get_inngest_client() -> inngest.Inngest:
@@ -36,148 +40,175 @@ def fetch_runs(event_id: str) -> list[dict]:
     return resp.json().get("data", [])
 
 
-def wait_for_run_output(
-    event_id: str,
-    timeout_s: float = 120.0,
-    poll_interval_s: float = 0.5,
-) -> dict:
+def wait_for_run_output(event_id: str, timeout_s: float = 120.0) -> dict:
     start = time.time()
-    last_status = None
-
     while True:
         runs = fetch_runs(event_id)
         if runs:
             run = runs[0]
             status = run.get("status")
-            last_status = status or last_status
-
             if status in ("Completed", "Succeeded", "Success", "Finished"):
                 return run.get("output") or {}
-
             if status in ("Failed", "Cancelled"):
-                raise RuntimeError(f"Function run {status}")
-
+                return {
+                    "answer": "An internal error occurred. Please try again.",
+                    "sources": [],
+                    "roles": [],
+                }
         if time.time() - start > timeout_s:
-            raise TimeoutError(
-                f"Timed out waiting for run output (last status: {last_status})"
-            )
-
-        time.sleep(poll_interval_s)
-
-
-# -------------------------------
-# File handling
-# -------------------------------
-
-def save_uploaded_pdf(file) -> Path:
-    uploads_dir = Path("uploads")
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-    file_path = uploads_dir / file.name
-    file_path.write_bytes(file.getbuffer())
-    return file_path
+            return {
+                "answer": "Timed out waiting for response. Please try again.",
+                "sources": [],
+                "roles": [],
+            }
+        time.sleep(0.4)
 
 
-async def send_rag_ingest_event(
-    pdf_path: Path,
-    policy_type: str,
-    version: str,
-    jurisdiction: str,
-):
+# -------------------------------------------------
+# Backend calls
+# -------------------------------------------------
+
+async def send_event(name: str, data: dict) -> str:
     client = get_inngest_client()
-    await client.send(
-        inngest.Event(
-            name="rag/ingest_pdf",
-            data={
-                "pdf_path": str(pdf_path.resolve()),
-                "source_id": pdf_path.name,
-                "policy_type": policy_type,
-                "version": version,
-                "jurisdiction": jurisdiction,
-            },
-        )
-    )
-
-
-async def send_rag_query_event(question: str, top_k: int) -> str:
-    client = get_inngest_client()
-    event_ids = await client.send(
-        inngest.Event(
-            name="rag/query_pdf_ai",
-            data={
-                "question": question,
-                "top_k": top_k,
-            },
-        )
-    )
+    event_ids = await client.send(inngest.Event(name=name, data=data))
     return event_ids[0]
 
 
-# -------------------------------
-# UI – Ingest
-# -------------------------------
+def list_documents() -> list[dict]:
+    event_id = asyncio.run(send_event("rag/list_documents", {}))
+    output = wait_for_run_output(event_id)
+    return output.get("documents", [])
 
-st.title("🔐 Security Policy RAG")
 
-st.header("Ingest a policy document")
+def delete_document(source_id: str):
+    event_id = asyncio.run(
+        send_event("rag/delete_document", {"source_id": source_id})
+    )
+    wait_for_run_output(event_id)
 
-policy_type = st.text_input("Policy type", placeholder="Access Control")
-version = st.text_input("Policy version", placeholder="2023.1")
-jurisdiction = st.text_input("Jurisdiction", placeholder="EU")
 
-uploaded = st.file_uploader(
-    "Upload a policy PDF",
+@st.cache_data
+def get_documents_cached():
+    return list_documents()
+
+
+# -------------------------------------------------
+# Sidebar – document management
+# -------------------------------------------------
+
+st.sidebar.title("📄 Documents")
+
+st.sidebar.subheader("➕ Add document")
+
+uploaded = st.sidebar.file_uploader(
+    "Upload policy PDF",
     type=["pdf"],
     accept_multiple_files=False,
 )
 
+# policy_type = st.sidebar.text_input("Policy type", placeholder="Access Control")
+# version = st.sidebar.text_input("Version", placeholder="2023.1")
+# jurisdiction = st.sidebar.text_input("Jurisdiction", placeholder="EU")
+
+if st.sidebar.button("🔄 Refresh documents"):
+    get_documents_cached.clear()
+    st.rerun()
+
 if uploaded is not None:
-    if st.button("Ingest policy"):
-        with st.spinner("Uploading and ingesting policy..."):
-            pdf_path = save_uploaded_pdf(uploaded)
-            asyncio.run(
-                send_rag_ingest_event(
-                    pdf_path=pdf_path,
-                    policy_type=policy_type,
-                    version=version,
-                    jurisdiction=jurisdiction,
+    if st.sidebar.button("Ingest document"):
+        with st.spinner("Ingesting document..."):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(uploaded.getbuffer())
+                pdf_path = Path(tmp.name)
+
+            event_id = asyncio.run(
+                send_event(
+                    "rag/ingest_pdf",
+                    {
+                        "pdf_path": str(pdf_path.resolve()),
+                        "policy_type": "policy_type",
+                        "version": "version",
+                        "jurisdiction": "jurisdiction",
+                    },
                 )
             )
-            time.sleep(0.3)
-        st.success(f"Ingestion triggered for: {pdf_path.name}")
 
+            wait_for_run_output(event_id)
+            pdf_path.unlink(missing_ok=True)
 
-st.divider()
+        st.success("Document ingested")
+        get_documents_cached.clear()
+        st.rerun()
 
-# -------------------------------
-# UI – Query
-# -------------------------------
+docs = get_documents_cached()
 
-st.header("Ask a question")
+if "selected_docs" not in st.session_state:
+    st.session_state.selected_docs = set(d["source_id"] for d in docs)
 
-with st.form("rag_query_form"):
-    question = st.text_input("Your question")
-    top_k = st.slider("Retrieval depth", 1, 10, 5)
-    submitted = st.form_submit_button("Ask")
+for doc in docs:
+    sid = doc["source_id"]
+
+    checked = sid in st.session_state.selected_docs
+    new_checked = st.sidebar.checkbox(
+        os.path.basename(sid),
+        value=checked,
+        key=f"chk_{sid}",
+        help=f"{doc.get('policy_type','')} | v{doc.get('version','')} | {doc.get('jurisdiction','')}",
+    )
+
+    if new_checked:
+        st.session_state.selected_docs.add(sid)
+    else:
+        st.session_state.selected_docs.discard(sid)
+
+    if st.sidebar.button("❌ Delete", key=f"del_{sid}"):
+        delete_document(sid)
+        st.session_state.selected_docs.discard(sid)
+        get_documents_cached.clear()
+        st.rerun()
+
+st.sidebar.caption("Unchecked documents are excluded from search.")
+
+# -------------------------------------------------
+# Main – query
+# -------------------------------------------------
+
+st.title("🔐 Security Policy Q&A")
+
+with st.form("query_form"):
+    question = st.text_input("Ask a question about the selected policies")
+    submitted = st.form_submit_button(
+        "Ask",
+        disabled=len(st.session_state.selected_docs) == 0
+    )
+
+if not st.session_state.selected_docs:
+    st.warning("No documents selected. Please select at least one document.")
 
 if submitted and question.strip():
-    with st.spinner("Searching policies and generating answer..."):
+    with st.spinner("Searching policies..."):
         event_id = asyncio.run(
-            send_rag_query_event(question.strip(), int(top_k))
+            send_event(
+                "rag/query_pdf_ai",
+                {
+                    "question": question.strip(),
+                    "allowed_sources": list(st.session_state.selected_docs),
+                },
+            )
         )
+
         output = wait_for_run_output(event_id)
 
-    answer = output.get("answer", "")
-    sources = output.get("sources", [])
-    roles = output.get("roles", [])
-
     st.subheader("Answer")
-    st.write(answer or "(No answer)")
+    st.write(output.get("answer", "(No answer)"))
 
+    roles = output.get("roles", [])
     if roles:
         st.subheader("Responsible roles")
         for r in roles:
             st.write(f"- {r}")
 
+    sources = output.get("sources", [])
     if sources:
         st.subheader("Sources")
         for s in sources:
