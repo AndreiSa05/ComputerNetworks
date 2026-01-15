@@ -16,9 +16,9 @@ load_dotenv()
 
 st.set_page_config(
     page_title="Security Policy RAG",
-    page_icon="🔐",
     layout="wide",
 )
+
 
 # -------------------------------------------------
 # Inngest helpers
@@ -64,6 +64,16 @@ def wait_for_run_output(event_id: str, timeout_s: float = 120.0) -> dict:
         time.sleep(0.4)
 
 
+def wait_for_document(source_id: str, timeout_s: float = 5.0, poll_interval: float = 0.5) -> list[dict] | None:
+    start = time.time()
+    while time.time() - start < timeout_s:
+        docs = list_documents()
+        if any(d["source_id"] == source_id for d in docs):
+            return docs
+        time.sleep(poll_interval)
+    return None
+
+
 # -------------------------------------------------
 # Backend calls
 # -------------------------------------------------
@@ -87,18 +97,12 @@ def delete_document(source_id: str):
     wait_for_run_output(event_id)
 
 
-@st.cache_data
-def get_documents_cached():
-    return list_documents()
-
-
 # -------------------------------------------------
 # Sidebar – document management
 # -------------------------------------------------
 
-st.sidebar.title("📄 Documents")
-
-st.sidebar.subheader("➕ Add document")
+st.sidebar.title("Documents")
+st.sidebar.subheader("Add document")
 
 uploaded = st.sidebar.file_uploader(
     "Upload policy PDF",
@@ -106,54 +110,86 @@ uploaded = st.sidebar.file_uploader(
     accept_multiple_files=False,
 )
 
-# policy_type = st.sidebar.text_input("Policy type", placeholder="Access Control")
-# version = st.sidebar.text_input("Version", placeholder="2023.1")
-# jurisdiction = st.sidebar.text_input("Jurisdiction", placeholder="EU")
+if "needs_refresh" not in st.session_state:
+    st.session_state.needs_refresh = True
 
-if st.sidebar.button("🔄 Refresh documents"):
-    get_documents_cached.clear()
+if st.sidebar.button("Refresh documents"):
+    st.session_state.needs_refresh = True
     st.rerun()
 
 if uploaded is not None:
     if st.sidebar.button("Ingest document"):
         with st.spinner("Ingesting document..."):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(uploaded.getbuffer())
-                pdf_path = Path(tmp.name)
+            original_filename = uploaded.name
 
-            event_id = asyncio.run(
-                send_event(
-                    "rag/ingest_pdf",
-                    {
-                        "pdf_path": str(pdf_path.resolve()),
-                        "policy_type": "policy_type",
-                        "version": "version",
-                        "jurisdiction": "jurisdiction",
-                    },
+            with tempfile.TemporaryDirectory() as tmpdir:
+                pdf_path = Path(tmpdir) / original_filename
+                pdf_path.write_bytes(uploaded.getbuffer())
+
+                event_id = asyncio.run(
+                    send_event(
+                        "rag/ingest_pdf",
+                        {
+                            "pdf_path": str(pdf_path.resolve()),
+                            "original_filename": original_filename,
+                            "policy_type": "policy_type",
+                            "version": "version",
+                            "jurisdiction": "jurisdiction",
+                        },
+                    )
                 )
-            )
 
-            wait_for_run_output(event_id)
-            pdf_path.unlink(missing_ok=True)
+                output = wait_for_run_output(event_id)
+
+        new_source_id = output.get("source_id")
+        if not new_source_id:
+            st.error("Ingest completed but no document ID was returned.")
+            st.stop()
+
+        with st.spinner("Finalizing document…"):
+            docs = wait_for_document(new_source_id)
+
+        if docs is None:
+            st.error("Document was ingested but did not appear in time.")
+            st.stop()
 
         st.success("Document ingested")
-        get_documents_cached.clear()
+        st.session_state.docs = docs
+        st.session_state.needs_refresh = False
         st.rerun()
 
-docs = get_documents_cached()
+if st.session_state.needs_refresh or not isinstance(st.session_state.get("docs"), list):
+    st.session_state.docs = list_documents()
+    st.session_state.needs_refresh = False
+
+docs = st.session_state.docs
+
+current_ids = {d["source_id"] for d in docs}
 
 if "selected_docs" not in st.session_state:
-    st.session_state.selected_docs = set(d["source_id"] for d in docs)
+    st.session_state.selected_docs = set(current_ids)
+else:
+    # add newly ingested docs
+    st.session_state.selected_docs |= current_ids
+    # remove deleted docs
+    st.session_state.selected_docs &= current_ids
 
 for doc in docs:
     sid = doc["source_id"]
 
+    display_name = doc.get(
+        "original_filename",
+        os.path.basename(sid),
+    )
+
     checked = sid in st.session_state.selected_docs
     new_checked = st.sidebar.checkbox(
-        os.path.basename(sid),
+        display_name,
         value=checked,
         key=f"chk_{sid}",
-        help=f"{doc.get('policy_type','')} | v{doc.get('version','')} | {doc.get('jurisdiction','')}",
+        help=f"{doc.get('policy_type', '')} | "
+             f"v{doc.get('version', '')} | "
+             f"{doc.get('jurisdiction', '')}",
     )
 
     if new_checked:
@@ -161,10 +197,10 @@ for doc in docs:
     else:
         st.session_state.selected_docs.discard(sid)
 
-    if st.sidebar.button("❌ Delete", key=f"del_{sid}"):
+    if st.sidebar.button("Delete", key=f"del_{sid}"):
         delete_document(sid)
         st.session_state.selected_docs.discard(sid)
-        get_documents_cached.clear()
+        st.session_state.needs_refresh = True
         st.rerun()
 
 st.sidebar.caption("Unchecked documents are excluded from search.")
@@ -173,7 +209,7 @@ st.sidebar.caption("Unchecked documents are excluded from search.")
 # Main – query
 # -------------------------------------------------
 
-st.title("🔐 Security Policy Q&A")
+st.title("Security Policy Q&A")
 
 with st.form("query_form"):
     question = st.text_input("Ask a question about the selected policies")
@@ -212,8 +248,13 @@ if submitted and question.strip():
     if sources:
         st.subheader("Sources")
         for s in sources:
+            display_name = s.get(
+                "original_filename",
+                os.path.basename(s.get("document", "")),
+            )
+
             st.markdown(
-                f"- **{os.path.basename(s.get('document',''))}**"
+                f"- **{display_name}**"
                 f"{' | ' + s['policy_type'] if s.get('policy_type') else ''}"
                 f"{' | v' + s['version'] if s.get('version') else ''}"
                 f"{' | ' + s['jurisdiction'] if s.get('jurisdiction') else ''}"

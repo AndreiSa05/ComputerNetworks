@@ -30,7 +30,7 @@ inngest_client = inngest.Inngest(
 async def rag_ingest_pdf(ctx: inngest.Context):
     def _load(ctx: inngest.Context) -> RAGChunkAndSrc:
         pdf_path = ctx.event.data["pdf_path"]
-        filename = os.path.basename(pdf_path)
+        filename = ctx.event.data.get("original_filename", "unknown.pdf")
         timestamp = datetime.utcnow().isoformat(timespec="seconds")
         source_id = f"{filename}::{timestamp}"
         chunks = load_and_chunk_pdf(pdf_path)
@@ -56,7 +56,10 @@ async def rag_ingest_pdf(ctx: inngest.Context):
 
     chunks_and_src = await ctx.step.run("load-and-chunk", lambda: _load(ctx), output_type=RAGChunkAndSrc)
     ingested = await ctx.step.run("embed-and-upsert", lambda: _upsert(chunks_and_src), output_type=RAGUpsertResult)
-    return ingested.model_dump()
+    return {
+        **ingested.model_dump(),
+        "source_id": chunks_and_src.source_id,
+    }
 
 
 @inngest_client.create_function(
